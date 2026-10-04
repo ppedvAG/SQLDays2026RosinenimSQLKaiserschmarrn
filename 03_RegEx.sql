@@ -1,12 +1,31 @@
+/*
+Neu in SQL Server 2025: Reguläre Ausdrücke (RegEx)
+Bisher musste man Textmuster mit LIKE, PATINDEX, CHARINDEX, REPLACE und vielen
+verschachtelten Funktionen prüfen. SQL Server 2025 (Kompatibilitätsgrad 170) bringt
+native RegEx-Funktionen mit:
+  REGEXP_LIKE      - prüft, ob ein Text zu einem Muster passt (Prädikat, z. B. in WHERE/CASE)
+  REGEXP_REPLACE   - ersetzt Textteile, die zum Muster passen
+  REGEXP_SUBSTR    - liefert den Teil des Textes, der zum Muster passt
+  REGEXP_INSTR     - liefert die Position des Treffers
+  REGEXP_COUNT     - zählt die Treffer
+  REGEXP_MATCHES / REGEXP_SPLIT_TO_TABLE - tabellenwertige Funktionen: ein Treffer bzw. ein Token pro Zeile
+Ein Muster besteht aus Zeichenklassen ([A-Z0-9]), Quantifizierern (+, *, {2,}),
+Ankern (^ Anfang, $ Ende) und maskierten Sonderzeichen (\. für einen echten Punkt).
+Typische Einsatzfälle: E-Mail-Validierung, Extraktion von Kundencodes, Normalisierung
+von Telefonnummern, Zerlegen von Listen. Die Auswertung läuft direkt in der Engine,
+es sind keine CLR-Funktionen oder Workarounds mehr nötig.
+Voraussetzung: Datenbank SQL2025Workshop (Skript 01) mit der Tabelle demo.KontaktImport.
+*/
+
 --Neu ist die Funktion für RegEx. Damit kann man z.B. E-Mail-Adressen prüfen, ob eine E-Mail-Adresse formal plausibel ist.
 
---Ohnen RegEx, war die Prüfung bedeutend schwieriger.
+-- Ohne RegEx war die Prüfung bedeutend schwieriger.
 -- Man musste viele Funktionen kombinieren, um z.B. die Position des @-Zeichens zu prüfen
 --, ob es nur einmal vorkommt, ob es ein Punkt nach dem @ gibt usw.
 
 -- Beispiel für Email Prüfung ohne RegEx
 
---diese Beispiel prüft, ob das @-Zeichen nur einmal vorkommt und ob nach dem @-Zeichen ein Punkt vorkommt.
+-- Dieses Beispiel prüft, ob das @-Zeichen nur einmal vorkommt und ob nach dem @-Zeichen ein Punkt vorkommt.
 -- es müsste noch weiter geprüft werden, ob die E-Mail-Adresse nicht mit einem Punkt endet, ob sie nicht mit einem @ beginnt usw.
 
 
@@ -25,7 +44,7 @@ SELECT
     END AS Bewertung
  FROM demo.KontaktImport;
 
---RegEx hatr folgende Funkionen: 
+-- RegEx hat folgende Funktionen: 
 -- REGEXP_LIKE() prüft, ob ein String einem Muster entspricht
 -- REGEXP_REPLACE() ersetzt Teile eines Strings, die einem Muster entsprechen
 -- REGEXP_SUBSTR() gibt den Teil eines Strings zurück, der einem Muster entspricht
@@ -39,7 +58,9 @@ SELECT KontaktID,Firmenname,EMail,
 		 ELSE 'auffällig' END Bewertung
 FROM demo.KontaktImport;
 
---weitere besipiele für den Einsatz von RegEx:
+-- Weitere Beispiele für den Einsatz von RegEx:
+-- Domain = alles nach dem @, TLD = Endung inkl. Domain-Teil, Position = Trefferposition (1 = Muster beginnt am Textanfang),
+-- Anzahl = Anzahl der Treffer (hier 1 oder 0, da das Muster mit ^ und $ den ganzen Text umschließt)
 
 select KontaktID,Firmenname,EMail,
 		REGEXP_REPLACE(EMail, '^[A-Za-z0-9._%+-]+@', '') as Domain,
@@ -51,7 +72,7 @@ from demo.KontaktImport;
 
 /*
 ^[A-Za-z0-9._%+-]+@' 
-	bdeutet, dass die E-Mail-Adresse mit einem 
+	bedeutet, dass die E-Mail-Adresse mit einem 
 	oder mehreren Zeichen aus dem Bereich A-Z, a-z, 0-9, Punkt, Unterstrich, Prozentzeichen, Pluszeichen oder Bindestrich beginnen muss,
 	gefolgt von einem @-Zeichen.
 
@@ -65,8 +86,9 @@ from demo.KontaktImport;
 */
 
 --
--- RegExp_SUBSTR
+-- REGEXP_SUBSTR, REGEXP_REPLACE und REGEXP_COUNT
 
+-- Testdaten ansehen
 select * from demo.KontaktImport
 
 
@@ -81,22 +103,24 @@ FROM demo.KontaktImport;
 --Splitte die Spalte  Freitext in mehrere Zeilen, die durch Semikolons getrennt sind.
 
 --';\s*' bedeutet, dass der String durch ein Semikolon und optional durch beliebig viele Leerzeichen getrennt ist.
---Das \s steht für ein Leerzeichen und das * bedeutet, dass beliebig viele Leerzeichen vorkommen können, auch keine. 
+--Das \s steht für ein Leerraumzeichen (Leerzeichen, Tab, Zeilenumbruch) und das * bedeutet, dass beliebig viele Leerzeichen vorkommen können, auch keine. 
 --Das ist nützlich, um z.B. eine Liste von Werten zu trennen, die durch Semikolons getrennt sind, aber auch Leerzeichen enthalten können.
 select * from demo.KontaktImport
+-- REGEXP_SPLIT_TO_TABLE liefert pro Teilstück eine Zeile (Spalte value), CROSS APPLY verbindet sie mit der Ursprungszeile
 SELECT k.KontaktID,s.value Token
 FROM demo.KontaktImport k
 CROSS APPLY REGEXP_SPLIT_TO_TABLE(k.Freitext,';\s*') s;
 
-Kunde: A-100; Region: Nord
+-- Beispielinhalt der Spalte Freitext: Kunde: A-100; Region: Nord
 
 
 --Im folgenden Beispiel wird geprüft, ob die Telefonnummer vorhanden ist und ob die Region im Freitext angegeben ist.
---und mit RegExp_Replace
+--und mit REGEXP_REPLACE die Region extrahiert.
 select * from demo.KontaktImport	
 
--- REGEXP_SUBSTR(Freitext,'Region: [A-Za-zÄÖÜäöüß]+' sucht nach dem Muster "Region: " 
---
+-- REGEXP_SUBSTR(Freitext,'Region: [A-Za-zÄÖÜäöüß]+') sucht nach dem Muster "Region: " gefolgt von einem oder mehreren Buchstaben.
+-- REGEXP_REPLACE entfernt anschließend das Präfix 'Region: ', sodass nur der Regionsname übrig bleibt.
+-- COALESCE(Telefon,'') verhindert NULL, REGEXP_LIKE prüft, ob mindestens eine Ziffer vorhanden ist.
 
 SELECT KontaktID,
  CASE WHEN 

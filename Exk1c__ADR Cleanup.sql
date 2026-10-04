@@ -1,4 +1,22 @@
 /*
+Exkurs ADR, Teil 3: Persistent Version Store (PVS) überwachen und bereinigen
+Bei ADR werden Zeilenversionen im Persistent Version Store (PVS) in der Benutzerdatenbank abgelegt.
+Ein Hintergrundprozess (ADR Cleaner) entfernt nicht mehr benötigte Versionen. Wenn die Bereinigung
+blockiert wird, wächst das PVS und belegt Speicherplatz in der Datenbank.
+Typische Ursachen für ein wachsendes PVS:
+  - Lange laufende aktive Transaktionen oder Snapshot-Transaktionen (älteste aktive Transaktion verhindert Aufräumen)
+  - Viele abgebrochene Transaktionen, die noch bereinigt werden müssen
+  - Online-Indexoperationen, die eigene Versionen halten
+Das Skript enthält:
+  1. Eine Überwachungsabfrage auf sys.dm_tran_persistent_version_store_stats mit PVS-Größe in GB, Anteil an der
+     Datenbankgröße, Anzahl abgebrochener Transaktionen, Start/Ende des Cleaners und der ältesten aktiven Transaktion.
+  2. sys.sp_persistent_version_cleanup: stößt die Bereinigung manuell an.
+  3. Eine Abfrage auf sys.dm_tran_active_snapshot_database_transactions, um die älteste aktive Transaktion zu finden.
+Erst wenn diese Transaktion beendet ist, kann das PVS geleert werden.
+Voraussetzung: Datenbank NewStyle aus den Skripten Exk1a und Exk1b.
+*/
+
+/*
 
 Beispielabfrage zeigt alle Informationen zu den Bereinigungsprozessen
 sowie die aktuelle PVS-Größe, die älteste abgebrochene Transaktion und weitere Details:
@@ -8,6 +26,7 @@ USE NewStyle;
 GO
 
 
+-- PVS-Überwachung: Größe, Anteil an der Datenbank, abgebrochene Transaktionen und Cleaner-Zeiten
 SELECT
  db_name(pvss.database_id) AS DBName,
  pvss.persistent_version_store_size_kb / 1024. / 1024 AS persistent_version_store_size_gb,
@@ -35,15 +54,15 @@ ON pvss.min_transaction_timestamp = asdt.transaction_sequence_num
    pvss.online_index_min_transaction_timestamp = asdt.transaction_sequence_num
 WHERE pvss.database_id = DB_ID();
 
---Cleanup mauell:
+--Cleanup manuell anstoßen (Bereinigung des PVS):
 
 EXEC sys.sp_persistent_version_cleanup;
 GO
 
 -- Zeigt die älteste aktive Transaktion
---solnage diese nch läuft , kann der PVS nicht geleert werden
+--solange diese noch läuft, kann der PVS nicht geleert werden
 SELECT * FROM sys.dm_tran_active_snapshot_database_transactions
 ORDER BY elapsed_time_seconds DESC;
 
---Exklusive Locks können den Cleanup hindern
+--Exklusive Sperren können den Cleanup verhindern
 

@@ -1,10 +1,28 @@
 /*
-Parameter Sensitivity Plan
+Parameter Sensitive Plan (PSP) Optimization und Optional Parameter Optimization (OPO/OPPO)
+Beide Features gehören zum Intelligent Query Processing und lösen Parameter-Sniffing-Probleme:
+PSP-Optimierung (seit SQL Server 2022):
+  Bei ungleich verteilten Daten (z. B. Kunde 1 = 10 Zeilen, Kunde 2 = 1.000.000 Zeilen) ist ein einzelner
+  Plan für alle Parameterwerte schlecht (Seek + Key Lookup vs. Scan). SQL Server erkennt über die Histogramme
+  der Statistik die Schieflage und erzeugt bis zu drei Planvarianten für eine parametrisierte Abfrage.
+  Ein "Dispatcher" im Plan wählt zur Laufzeit abhängig vom Parameterwert die passende Variante.
+  Derzeit nur für Gleichheitsprädikate. Voraussetzung: Kompatibilitätsgrad 160 oder höher.
+OPO bzw. OPPO (neu in SQL Server 2025):
+  Bei optionalen Parametern (WHERE FilialID = @FilialID OR @FilialID IS NULL) entsteht bisher immer ein
+  Scan-Plan. Mit OPTIONAL_PARAMETER_OPTIMIZATION = ON und Kompatibilitätsgrad 170 erzeugt der Optimizer
+  mehrere Pläne: Scan bei NULL, Seek bei einem konkreten Wert - ohne RECOMPILE.
+Das Skript legt eine Tabelle mit extrem schiefer Verteilung an, zeigt die zwei Pläne in
+sys.dm_exec_query_stats und im Showplan-XML (Dispatcher, QueryVariantID) und vergleicht OPPO ein/aus.
+Voraussetzung: Datenbank IQP_Demo2025 (muss vorhanden sein).
+*/
+
+/*
+Parameter Sensitive Plan (PSP)
 
  bezieht sich auf einen Prozess, wobei SQL Server 
  die aktuellen Parameter während der Kompilierung oder Neukompilierung 
  ermittelt und diese an den Abfrageoptimierer übermittelt
- , sodass sie zum Generieren potenziell effizienter 
+ , sodass sie zum Generieren potenziell effizienterer 
  Abfrageausführungspläne verwendet werden können.
 
  Parameterwerte werden während der Kompilierung oder Neukompilierung 
@@ -24,7 +42,7 @@ Parameter Sensitivity Plan
  Batch- oder gespeicherte Prozedur übergeben wurden
  , sondern auf ihre Werte zum Zeitpunkt der Neukompilierung. 
  Diese Werte wurden möglicherweise innerhalb der Prozedur geändert
- , bevor Sie die anweisung erreichen, die enthält RECOMPILE. 
+ , bevor sie die Anweisung erreichen, die RECOMPILE enthält. 
  Dieses Verhalten kann die Leistung für Abfragen mit 
  stark variablen oder schiefen Eingabedaten verbessern.
  
@@ -41,7 +59,7 @@ Hier ist ein Beispiel für eine Abfrage, die eine lokale Variable verwendet.
 
 Optimierung des Parameterempfindlichkeitsplans (Parameter Sensitivity Plan, PSP) 
 
- Dieser wurde für Szenarios entwickelt, in denen ein 
+ Dieser wurde für Szenarien entwickelt, in denen ein 
  einzelner zwischengespeicherter Plan für eine parametrisierte 
  Abfrage nicht für alle möglichen eingehenden Parameterwerte optimal ist. 
  Dies ist bei uneinheitlichen Datenverteilungen der Fall. 
@@ -62,7 +80,7 @@ Optimierung des Parameterempfindlichkeitsplans (Parameter Sensitivity Plan, PSP)
  Optionale PSP-Optimierung
 
  derzeit nur mit Gleichheitsprädikaten.
- ?  Suche in eine Tabelle durchgeführt oder gescannt werden muss?
+ Bei optionalen Parametern: Soll in der Tabelle gesucht (Seek) oder gescannt werden?
 
  WHERE column1 = @p OR @p IS NULL;
 
@@ -94,7 +112,7 @@ Die OPTIONAL_PARAMETER_OPTIMIZATION Konfiguration
 USE IQP_Demo2025;
 GO
 
--- 1. Tabelle zurücksetzen
+-- 1. Tabelle zurücksetzen (Demodatenbank IQP_Demo2025 muss vorhanden sein)
 DROP TABLE IF EXISTS dbo.Bestellungen;
 
 CREATE TABLE dbo.Bestellungen (
@@ -129,7 +147,7 @@ UPDATE STATISTICS dbo.Bestellungen WITH FULLSCAN;
 GO
 
 -- 4. Testen, was der Optimizer NATIV bei Einzelabfragen machen würde
--- (Hier siehst du VOR der Prozedur, ob der Tipping-Point steht!)
+-- (Hier sieht man VOR der Prozedur, ob der Tipping Point erreicht ist!)
 SET STATISTICS XML ON;
 
 -- Muss: Index Seek + Key Lookup sein!
@@ -141,6 +159,7 @@ SELECT * FROM dbo.Bestellungen WHERE KundenTypID = 2;
 SET STATISTICS XML OFF;
 GO
 
+-- Prozedur mit Parameter: Der Plan wird beim ersten Aufruf erzeugt (Parameter Sniffing)
 CREATE OR ALTER PROCEDURE dbo.usp_GetBestellungenByType
     @KundenTypID INT
 AS
@@ -160,7 +179,7 @@ EXEC dbo.usp_GetBestellungenByType @KundenTypID = 1;
 EXEC dbo.usp_GetBestellungenByType @KundenTypID = 2;
 GO
 
---2 verschiedene Pläne..
+--2 verschiedene Pläne.. (PSP erzeugt zwei Varianten, jede mit eigener QueryVariantID)
 
 SELECT 
     qs.execution_count,
@@ -175,7 +194,8 @@ WHERE st.text LIKE '%dbo.Bestellungen%'
   AND st.text NOT LIKE '%sys.dm_exec_query_stats%'
 ORDER BY qs.execution_count DESC;
 
---Plan anseehen in XML--> Dispatcher/Showplan XML
+--Plan ansehen in XML--> Dispatcher/Showplan XML
+--(Der Dispatcher-Knoten im Plan verteilt die Aufrufe je nach Parameterwert auf die Varianten)
 
 
 WITH XMLNAMESPACES (DEFAULT 'http://schemas.microsoft.com/sqlserver/2004/07/showplan')
@@ -200,7 +220,7 @@ ORDER BY qs.execution_count DESC;
 
 
 
----OPO
+---OPO (Optional Parameter Optimization, auch OPPO genannt)
 USE IQP_Demo2025;
 GO
 
@@ -230,6 +250,7 @@ ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
 GO
 
 
+-- Mit OPTIONAL_PARAMETER_OPTIMIZATION = ON (Standard bei Kompatibilitätsgrad 170) entstehen zwei Pläne
 -- Fall 1: NULL übergeben
 -- Erwartung: Clustered Index Scan (liest alle Daten)
 EXEC dbo.usp_SucheBestellungenOptional @FilialID = NULL;
@@ -238,6 +259,7 @@ EXEC dbo.usp_SucheBestellungenOptional @FilialID = NULL;
 -- Erwartung: Index Seek auf IX_FilialID (ohne Recompile!)
 EXEC dbo.usp_SucheBestellungenOptional @FilialID = 99;
 
+-- OPO ausschalten, um das alte Verhalten zu zeigen: ein einziger Plan für alle Aufrufe
 ALTER DATABASE SCOPED CONFIGURATION SET OPTIONAL_PARAMETER_OPTIMIZATION = OFF;
 
 
@@ -263,8 +285,8 @@ GO
 ALTER DATABASE SCOPED CONFIGURATION CLEAR PROCEDURE_CACHE;
 GO
 
--- Lauf A: Kein Filter übergeben
+-- Lauf A: Kein Filter übergeben. Der Scan-Plan wird gecacht und danach auch für Lauf B verwendet
 EXEC dbo.usp_SucheBestellungenOptional @FilialID = NULL;
 
--- Lauf B: Konkreter Filter übergeben
+-- Lauf B: Konkreter Filter übergeben (nutzt ohne OPO ebenfalls den Scan, obwohl ein Seek besser wäre)
 EXEC dbo.usp_SucheBestellungenOptional @FilialID = 99;
