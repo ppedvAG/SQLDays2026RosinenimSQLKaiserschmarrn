@@ -1,3 +1,21 @@
+/*
+Optimized Locking - Demo mit zwei Sitzungen: SESSION 2 (Beobachtende Sitzung)
+Dieses Skript gehört zu 09a_OptimizedLocking.sql (Session 1) und läuft in einem zweiten Abfragefenster.
+Es zeigt, was auf dem Server passiert, während Session 1 eine Transaktion offen hält.
+Teil 1 (OPTIMIZED_LOCKING = OFF in Session 1):
+  - sys.dm_tran_locks zeigt tausende KEY- bzw. PAGE-Sperren, bei mehr als ca. 5.000 Sperren
+    eskaliert SQL Server auf eine Objektsperre (X).
+  - Ein Update auf eine andere Zeile (AccountID = 50000) wird blockiert, weil die Tabelle gesperrt ist.
+Teil 2 (OPTIMIZED_LOCKING = ON in Session 1):
+  - Die Objektsperre X entfällt, es bleibt nur IX auf Tabellenebene. IX ist mit IX anderer Transaktionen
+    kompatibel, daher können parallele Transaktionen arbeiten.
+  - Neu ist die XACT-Sperre: Die Transaktions-ID (TID) steht im Header der Datenzeile (ADR-Versionierung),
+    und der Lock Manager verwaltet pro Transaktion nur einen Eintrag statt eines Eintrags pro Zeile.
+  - Das Update auf AccountID = 50000 läuft ohne Wartezeit durch.
+Am Ende des Skripts erklärt eine ASCII-Grafik, wie Datenseite, TID und Lock Manager zusammenspielen.
+Hinweis: Die Grafik am Dateiende ist als Kommentar eingeschlossen, damit das Skript ausführbar bleibt.
+*/
+
 USE SQL2025Workshop
 GO
 
@@ -10,7 +28,7 @@ SELECT resource_type, request_mode, COUNT(*) AS LockCount
 FROM sys.dm_tran_locks
 WHERE resource_database_id = DB_ID()
 GROUP BY resource_type, request_mode;
---> mehr als 5000 Zeilen --> key Sperren--> Objekt Sperren (Schlüssel) --> Lock Escalation greift
+--> mehr als 5000 Zeilen --> Key-Sperren --> Objektsperren (Tabelle) --> Lock Escalation greift
 
 -- 2. Paralleles Update auf eine ANDERE Zeile versuchen:
 -- (Wird blockiert, wenn der Scan über gesperrte Bereiche stolpert oder Lock Escalation greift)
@@ -21,18 +39,18 @@ WHERE AccountID = 50000;
 --> Zurück zu Session 1
 
 
---> Weider zurück aus Session 1
+--> Wieder zurück aus Session 1
 SELECT resource_type, request_mode, COUNT(*) AS LockCount
 FROM sys.dm_tran_locks
 WHERE resource_database_id = DB_ID()
 GROUP BY resource_type, request_mode;
 
---Die Object Sperre X ist weg , dafür IX. IX und X ist nocht kompatibel, daher müssen andere warten.
---                                        IX und IX zweier Transcations sind aber kompatibel
---							 Objekt bekommt INformation, dass irgendwo darunter eine Sperre exisiert. 
---							 Daher entfällt das aufwendige Suchen nach zb Sperren pro Zeile
--- neu XACT: eine Sperre auf Transaktionsebene: TransaktionsID wird in den Header der Seite geschrieben. Im Lockmanager nur 1 Eintrag
--- ohne Optimized Locking-- im Lockmanager für jede Zeilensperren ein Eintrag
+--Die Objektsperre X ist weg, dafür gibt es IX. IX und X sind nicht kompatibel, daher müssten andere warten.
+--                                        IX und IX zweier Transaktionen sind aber kompatibel.
+--							 Das Objekt bekommt die Information, dass irgendwo darunter eine Sperre existiert. 
+--							 Daher entfällt das aufwendige Suchen nach z. B. Sperren pro Zeile.
+-- Neu ist XACT: eine Sperre auf Transaktionsebene. Die Transaktions-ID wird in den Header der Zeile geschrieben. Im Lock Manager gibt es nur 1 Eintrag.
+-- Ohne Optimized Locking gibt es im Lock Manager für jede Zeilensperre einen Eintrag.
 
 UPDATE dbo.Accounts
 SET Balance = Balance + 100
@@ -40,6 +58,7 @@ WHERE AccountID = 50000;
 
 
 
+/* Schematische Darstellung (als Kommentar, damit das Skript ausführbar bleibt)
 +-----------------------------------------------------------------------------------+
 | SQL Server 8-KB Data Page (im Buffer Pool / Speicher)                             |
 |                                                                                   |
@@ -76,3 +95,4 @@ WHERE AccountID = 50000;
 |  Vorteil: Tausende geänderte Zeilen zeigen alle auf DENSELBEN TID-Eintrag.        |
 |  Keine Millionen Einzelsperren auf KEY/PAGE-Ebene!                                |
 +-----------------------------------------------------------------------------------+
+*/

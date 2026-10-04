@@ -1,4 +1,23 @@
-/* Prüfung
+/*
+Neu in SQL Server 2025: tempdb-Platzbegrenzung pro Workload Group (Resource Governor)
+Ein einzelner Benutzer oder eine Anwendung kann die tempdb komplett füllen (große Sortierungen, #-Tabellen,
+Hash-Operationen) und damit den ganzen Server lahmlegen. Der Resource Governor kann nun den
+tempdb-Datenplatz pro Workload Group begrenzen:
+  GROUP_MAX_TEMPDB_DATA_MB       - fester Grenzwert in Megabyte
+  GROUP_MAX_TEMPDB_DATA_PERCENT  - Grenzwert in Prozent der tempdb-Größe; wächst die tempdb, wächst auch das Limit
+Überschreitet eine Sitzung das Limit, wird die Anweisung mit Fehler 1138 abgebrochen; andere Workloads laufen weiter.
+Die Sichten sys.resource_governor_workload_groups (Konfiguration) und
+sys.dm_resource_governor_workload_groups (tempdb_data_space_kb, peak_tempdb_data_space_kb,
+total_tempdb_data_limit_violation_count) zeigen Einstellungen und Verbrauch.
+Regeln für die Prozentangabe: GROUP_MAX_TEMPDB_DATA_MB darf nicht gesetzt sein, und entweder haben alle
+Datendateien ein MAXSIZE ungleich UNLIMITED (Bezugsgröße = Summe der MAXSIZE-Werte) oder alle haben
+MAXSIZE = UNLIMITED bei FILEGROWTH = 0 (Bezugsgröße = Summe der SIZE-Werte). Sonst ist die Angabe ungültig.
+Ablauf: 1. Grenzwert in MB setzen und mit #-Tabellen aus sys.messages testen, 2. tempdb-Dateien begrenzen
+(feste Limits mit Vorsicht), 3. Prozentgrenzen testen, 4. Aufräumen und Resource Governor zurücksetzen.
+Achtung: Das Skript verändert die tempdb-Dateien und den Resource Governor, nur in Testsystemen ausführen.
+*/
+
+/* Prüfung (Hilfsabfragen für Dateigrößen und Wachstum der tempdb)
 
 SELECT file_id,
        name,
@@ -24,7 +43,7 @@ WHERE type_desc = 'ROWS';          -- Nur Datendateien (kein Log)
 
  /* TEMPDB Workload Group Limits für Tempdb
 
-  Ab SQL Server 2022 (16.x) können Sie die Ressourcengovernor-Workload-Gruppen so konfigurieren, 
+  Ab SQL Server 2025 (17.x) können Sie die Resource-Governor-Workload-Gruppen so konfigurieren, 
   dass sie die Nutzung von tempdb-Daten einschränken. 
   Dies ist besonders nützlich in gemeinsam genutzten Umgebungen, 
   in denen mehrere Workloads um die Ressourcen der tempdb konkurrieren.
@@ -33,7 +52,7 @@ WHERE type_desc = 'ROWS';          -- Nur Datendateien (kein Log)
   was zu Leistungsproblemen für andere Workloads führen könnte.
   */
 
- --Festlegen eines Grenzwertes in MB für Defaul WLgroup
+ --Festlegen eines Grenzwertes in MB für die Default-Workload-Group
 
 ----------------------------------------------
  --Zurücksetzen aller Werte und Kontrolle
@@ -41,11 +60,13 @@ ALTER WORKLOAD GROUP [default]
 WITH (GROUP_MAX_TEMPDB_DATA_MB = NULL, GROUP_MAX_TEMPDB_DATA_PERCENT = NULL);
 ALTER RESOURCE GOVERNOR RECONFIGURE;
 
+-- Dateigrößen der tempdb wieder ohne Obergrenze (Voraussetzung: vier Datendateien tempdev und temp2 bis temp4)
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'tempdev', MAXSIZE = UNLIMITED);
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp2', FILEGROWTH = 64 MB, MAXSIZE = UNLIMITED);
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp3', FILEGROWTH = 64 MB, MAXSIZE = UNLIMITED);
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp4', FILEGROWTH = 64 MB, MAXSIZE = UNLIMITED);
 
+-- Temporäre Tabellen der Demo entfernen
 drop table if exists #t1;
 drop table if exists #t2;
 drop table if exists #t3;
@@ -66,16 +87,16 @@ WHERE name = 'default';
 -----------------------------
 
 -----------------------------------------------
--- Festelegen einers Limits pro Workload Groupt
+-- Festlegen eines Limits pro Workload Group
 -----------------------------------------------
 
 
 
---Festlegen auf Maximalen Verbrauch in MB
+--Festlegen auf maximalen Verbrauch in MB (hier 100 MB für die Default-Gruppe)
 ALTER WORKLOAD GROUP [default] WITH (GROUP_MAX_TEMPDB_DATA_MB = 100);
 ALTER RESOURCE GOVERNOR RECONFIGURE;
 
---Worklad Group prüfen
+--Workload Group prüfen
 SELECT group_id,
        name,
        group_max_tempdb_data_mb,
@@ -95,18 +116,18 @@ SELECT group_id,       name,
 FROM sys.dm_resource_governor_workload_groups
 WHERE name = 'default';
 
---Erhöhen des Limits:
+--Erhöhen des Limits: Nun passt die zweite Tabelle in das Limit
 ALTER WORKLOAD GROUP [default] WITH (GROUP_MAX_TEMPDB_DATA_MB = 250);
 ALTER RESOURCE GOVERNOR RECONFIGURE;
 
---sollte nun gehen
+--sollte nun gehen (#t1 wird vorher gelöscht, damit der Platz frei wird)
 drop table if exists #t1
 SELECT * INTO #t2 FROM sys.messages; --96MB
 
 
 -----------------------------------------------------
 -- DEMO 
--- Festelegen eines tempdb Limits
+-- Festlegen eines tempdb-Limits
 -----------------------------------------------------
 
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'tempdev', MAXSIZE = 256 MB);
@@ -134,7 +155,7 @@ SELECT * INTO #t4 FROM sys.messages; --96MB
 -- Daher sind feste Limits mit Vorsicht zu genießen.
 
 ---------------------------------------------------------------------------
--- Neu ist, dass die tempdb -Nutzung pro Workload Group auch in Prozent
+-- Neu ist, dass die tempdb-Nutzung pro Workload Group auch in Prozent
 -- angegeben werden kann.
 -- wächst die tempdb, wächst auch die erlaubte Nutzung für die Workload Group.
 ---------------------------------------------------------------------------
@@ -183,7 +204,7 @@ WHERE name = 'default';
 * insbesondere in Szenarien mit wechselnden Workloads und tempdb-Nutzungen.
 
 
-Hier gelten aber bestimmte Rahmenbedungen:
+Hier gelten aber bestimmte Rahmenbedingungen:
 https://learn.microsoft.com/en-us/sql/relational-databases/resource-governor/tempdb-space-resource-governance?view=sql-server-ver17
 
 - GROUP_MAX_TEMPDB_DATA_MB ist nicht festgelegt
@@ -204,7 +225,8 @@ Die Summe der SIZEWerte für alle Datendateien	100%
 Alle anderen Konfigurationen			NEIN
 */
 
---evtl Neustart und mehrfach ausführen, bis tempdb wieder klein ist
+--evtl. Neustart und mehrfach ausführen, bis die tempdb wieder klein ist
+--(kleine Dateien und Obergrenzen, damit die Prozentangabe eine überschaubare Bezugsgröße hat)
 USE [tempdb]
 GO
 DBCC SHRINKFILE (N'tempdev' , 8)
@@ -225,7 +247,7 @@ ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp3',   MAXSIZE = 20 MB);
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp4',   MAXSIZE = 20 MB);
 
 
----Akt Status der Dateien --------------
+---Aktueller Status der Dateien --------------
 SELECT 
     name,
     size * 8 / 1024 AS CurrentSize_MB,
@@ -246,13 +268,13 @@ GO
 ALTER WORKLOAD GROUP [default]
 WITH (GROUP_MAX_TEMPDB_DATA_PERCENT = 20); 
 ALTER RESOURCE GOVERNOR RECONFIGURE;
---Tabelle mit best Größe anlegen
+--Tabelle mit bestimmter Größe anlegen
 
 USE tempdb;
 GO
 
 -- 1. Wie groß soll die Tabelle sein? (Hier ändern!)
-DECLARE @WunschMB INT =36; -- Beispiel: 100 MB
+DECLARE @WunschMB INT =36; -- Beispiel: 36 MB
 
 -- 2. Berechnung: 1 MB ca. 128 Data-Pages (128 * 8KB = 1024KB)
 DECLARE @BenötigteZeilen INT = @WunschMB * 128;
@@ -268,7 +290,7 @@ EXEC sp_spaceused '#t_SizeTest';
 DROP TABLE IF EXISTS #t_SizeTest;
 
 
---nun mit MAX MB
+--nun mit MAX MB (der feste MB-Wert hat Vorrang vor der Prozentangabe, daher ist beides zusammen ungültig)
 ALTER WORKLOAD GROUP [default]
 WITH (GROUP_MAX_TEMPDB_DATA_MB = 500 ); --3,2 MB
 
@@ -276,7 +298,7 @@ WITH (GROUP_MAX_TEMPDB_DATA_MB = 500 ); --3,2 MB
 
 
 
---in welcher Gruppe bin ich
+--In welcher Gruppe bin ich? (zeigt Workload Group und Resource Pool der aktuellen Sitzung)
 SELECT 
     s.session_id,
     g.name as [Workload Group],
@@ -349,10 +371,11 @@ SELECT group_id,
        total_tempdb_data_limit_violation_count
 FROM sys.dm_resource_governor_workload_groups
 WHERE name = 'default';
---tatal_temdb_data_limit_violation_count wurd erhöht
+--total_tempdb_data_limit_violation_count wurde erhöht
 
 
 --Grenze entfernen..
+--(MB und Prozent gleichzeitig zu setzen ist nicht zulässig, anschließend werden beide Grenzwerte auf NULL gesetzt)
 ALTER WORKLOAD GROUP [default]
 WITH (GROUP_MAX_TEMPDB_DATA_MB = 512, GROUP_MAX_TEMPDB_DATA_PERCENT = 5);
 
@@ -365,21 +388,21 @@ ALTER RESOURCE GOVERNOR DISABLE;
 
 
 
---Angabe in ProzentALTER DATABASE tempdb MODIFY FILE (NAME = N'tempdev', FILEGROWTH = 64 MB, MAXSIZE = 256 MB);
+--Angabe in Prozent
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'tempdev', FILEGROWTH = 64 MB, MAXSIZE = 256 MB);
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp2', FILEGROWTH = 64 MB, MAXSIZE = 256 MB);
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp3', FILEGROWTH = 64 MB, MAXSIZE = 256 MB);
 ALTER DATABASE tempdb MODIFY FILE (NAME = N'temp4', FILEGROWTH = 64 MB, MAXSIZE = 256 MB);
 
 
---Wieviel darf default verwenden-- immer dieselbe Größe in MB, auch wenn die DAteien größer werden dürfen?
+--Wie viel darf default verwenden? Die Prozentangabe bezieht sich auf die Summe der MAXSIZE-Werte (hier 4 x 256 MB)
 
 ALTER WORKLOAD GROUP [default]
 WITH (GROUP_MAX_TEMPDB_DATA_PERCENT = 5);
 
 ALTER RESOURCE GOVERNOR RECONFIGURE;
 
---Aktuell Settings abfragen
+--Aktuelle Einstellungen abfragen
 SELECT group_id,
        name,
        group_max_tempdb_data_mb,
@@ -394,7 +417,7 @@ WHERE name = 'default';
 --ENDE
 
 
---TempDB 
+--tempdb: Dateigrößen, Obergrenzen und Wachstum
 
 SELECT file_id,
        name,
